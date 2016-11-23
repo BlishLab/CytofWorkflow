@@ -1,0 +1,431 @@
+# CyTOF data analysis
+
+
+
+## Dimensionality reduction
+
+In this section, we will show an example of how to use R to create an
+interpretable representation of the samples in a CyTOF dataset. The
+idea is to "featurize" each sample in a useful way: in this analysis,
+we will partition the receptor space into 200 elements and use as
+features the fraction of cells in each sample which fall into each
+element of the partition. This gives us a count matrix with the number
+of cells in each sample falling into each element of the partition,
+and we use correspondence analysis to get a low-dimensional
+representation of this matrix.
+
+To get some intuition into the procedure, note that if the elements of
+the partition were all of the same size, the Euclidean distance
+between the vectors containing the fraction of each sample falling in
+each element of the partition would be a discrete approximation of the
+L2 divergence between distributions. We will use k-means to create the
+partition, which means that the elements of the partition will not be
+of the same size, but we can think of it as a variation on the L2
+divergence which upweights regions of receptor space which have higher
+average density. 
+
+
+First we load the required packages and read in our data. 
+
+```r
+set.seed(0)
+library(flowCore)
+library(flexclust)
+```
+
+```
+## Loading required package: grid
+```
+
+```
+## Loading required package: lattice
+```
+
+```
+## Loading required package: modeltools
+```
+
+```
+## Loading required package: stats4
+```
+
+```
+## 
+## Attaching package: 'modeltools'
+```
+
+```
+## The following object is masked from 'package:flowCore':
+## 
+##     parameters
+```
+
+```r
+library(ade4)
+library(stringr)
+library(viridis)
+library(ggrepel)
+library(ggplot2)
+fs = readRDS("data/flow_list_asinh.rds")
+expdata = readRDS("data/expdata.rds")
+```
+
+We do not want to use the results from donors 1 and 4, so we exclude
+them from the dataset. 
+
+```r
+# exclude experiments 1 and 4
+exp14 = which(expdata$Exp %in% c("Exp1", "Exp4"))
+fs =  fs[-exp14]
+expdata = expdata[-exp14,]
+```
+
+Next we rename some of the variables (this is just for so the plots
+have the right labels). 
+
+```r
+expdata$Stim = as.character(expdata$Stim)
+expdata$Stim[expdata$Stim == "uns"] = "unstimulated"
+expdata$Stim[expdata$Stim == "magic"] = "IL12/IL15/IL18"
+expdata$Donor = sapply(expdata$Exp, function(x) str_replace(x, "Exp", "Donor "))
+```
+
+Finally, we exclude CD4 and KIR2DL5 for technical reasons, and we
+exclude the functional markers for the purpose of this analysis. The
+same analysis can also be performed with the functional markers
+included. 
+
+```r
+excludedMarkers = c("CD4", "KIR2DL5")
+functionalMarkers = c("INFg", "TRAIL", "MIP1b", "GranzymeB", "CD107a", "GM.CSF", "TNFa", "Perforin")
+fs = lapply(fs, function(x) x[,!(colnames(x) %in% excludedMarkers)])
+fs = lapply(fs, function(x) x[,!(colnames(x) %in% functionalMarkers)])
+```
+
+
+
+Next we down-sample the cells so that when we perform k-means we are
+not over-weighting samples which have larger numbers of cells. We
+chose to downsample to 500 purely to save time, but increasing this
+number has almost no effect on the outcome. 
+
+```r
+sampledCells = lapply(fs, function(x) x[sample(nrow(x), 500), ])
+sampledCells = Reduce(rbind, sampledCells)
+```
+
+Next we perform k-means on the downsampled cells. 
+
+```r
+nclust = 200
+out.km = kmeans(sampledCells, centers = nclust, iter.max = 50)
+out.fc = as.kcca(out.km, sampledCells)
+```
+
+Finally, we assign each of the cells in the full data set to one of
+the clusters and count how many cells correspond to each cluster. This
+gives us a count matrix called cluster.sizes. 
+
+```r
+full.clusters = lapply(fs, function(x) predict(out.fc, newdata = x))
+cluster.sizes = t(sapply(full.clusters, function(x) {
+    sizes = table(x)
+    sizesLong = sizes[as.character(1:nclust)]
+    sizesLong[is.na(sizesLong)] = 0
+    return(sizesLong)
+}))
+rownames(cluster.sizes)= rownames(expdata)
+```
+
+Finally, we can perform correspondence analysis and make some
+plots. The first thing to look at is the scree plot which shows us the
+fraction of the inertia explained by each axis. 
+
+```r
+out.coa = dudi.coa(cluster.sizes, scannf = FALSE, nf = 4)
+plot(out.coa$eig, type = 'h')
+```
+
+![plot of chunk scree](figure/scree-1.png)
+
+Next we can look at the projections of the sample points onto the
+principal axes. 
+
+```r
+axis1percent = round(out.coa$eig[1] / sum(out.coa$eig) * 100, digits = 1)
+axis2percent = round(out.coa$eig[2] / sum(out.coa$eig) * 100, digits = 1)
+axis3percent = round(out.coa$eig[3] / sum(out.coa$eig) * 100, digits = 1)
+(p1 = ggplot(data.frame(out.coa$li, expdata)) +
+    geom_point(aes(x = Axis1, y = Axis2, color = Stim)) +
+        xlab(paste("Axis 1: ", axis1percent, "%", sep = "")) +
+        ylab(paste("Axis 2: ", axis2percent, "%", sep = "")))
+```
+
+![plot of chunk coasamples](figure/coasamples-1.png)
+
+```r
+ggplot(data.frame(out.coa$li, expdata)) +
+    geom_point(aes(x = Axis2, y = Axis3, color = Donor)) +
+    xlab(paste("Axis 2: ", axis2percent, "%", sep = "")) +
+    ylab(paste("Axis 3: ", axis3percent, "%", sep = ""))
+```
+
+![plot of chunk coasamples](figure/coasamples-2.png)
+
+To get an idea of whether the axes are easily interpretable in terms
+of a single receptor, we can look at the correlation between the
+cluster centers and the axes.
+
+```r
+cors = cor(out.fc@centers, out.coa$co)
+cors = data.frame(cors)
+cors$name = rownames(cors)
+(p2 = ggplot(cors, aes(x = Comp1, y = Comp2, label = name)) +
+    geom_text_repel( size = 2) + geom_point(size = 1) +
+        ylim(c(-.7, .5)) + xlim(c(-.95, .3)) +
+            xlab("Correlation with axis 1") + ylab("Correlation with\naxis 2"))
+```
+
+![plot of chunk coacors](figure/coacors-1.png)
+
+
+We see from the plot above that CD16 and CD69 are fairly strongly
+associated with the first and second axes, respectively. To validate
+this, we plot the projections of the clusters onto the principal
+plane, coloring the clusters by their average intensity of CD16 or
+CD69. 
+
+```r
+(p3 = ggplot(data.frame(out.coa$co, out.fc@centers)) +
+    geom_point(aes(x = Comp1, y = Comp2, color = CD16)) + scale_color_viridis() +
+    xlab(paste("Axis 1: ", axis1percent, "%", sep = "")) +
+    ylab(paste("Axis 2: ", axis2percent, "%", sep = "")))
+```
+
+![plot of chunk coavariables](figure/coavariables-1.png)
+
+```r
+(p4 = ggplot(data.frame(out.coa$co, out.fc@centers)) +
+    geom_point(aes(x = Comp1, y = Comp2, color = CD69)) + scale_color_viridis() +
+    xlab(paste("Axis 1: ", axis1percent, "%", sep = "")) +
+    ylab(paste("Axis 2: ", axis2percent, "%", sep = "")))
+```
+
+![plot of chunk coavariables](figure/coavariables-2.png)
+
+
+
+
+
+Next we can look at the results of the same analysis with the
+functional markers included.
+
+We re-read in the data:
+
+```r
+set.seed(0)
+fs = readRDS("../cytof_stims/flow_list_asinh.rds")
+expdata = readRDS("../cytof_stims/expdata.rds")
+# exclude experiments 1 and 4
+exp14 = which(expdata$Exp %in% c("Exp1", "Exp4"))
+fs =  fs[-exp14]
+expdata = expdata[-exp14,]
+expdata$Stim = as.character(expdata$Stim)
+expdata$Stim[expdata$Stim == "magic"] = "IL12/IL15/IL18"
+expdata$Stim[expdata$Stim == "uns"] = "unstimulated"
+expdata$Donor = sapply(expdata$Exp, function(x) str_replace(x, "Exp", "Donor "))
+
+excludedMarkers = c("CD4", "KIR2DL5")
+fs = lapply(fs, function(x) x[,!(colnames(x) %in% excludedMarkers)])
+```
+
+Then we downsample, perform k means, and make the cluster size
+matrix.
+
+```r
+sampledCells = lapply(fs, function(x) x[sample(nrow(x), 500), ])
+sampledCells = Reduce(rbind, sampledCells)
+nclust = 200
+out.km = kmeans(sampledCells, centers = nclust, iter.max = 50)
+out.fc = as.kcca(out.km, sampledCells)
+full.clusters = lapply(fs, function(x) predict(out.fc, newdata = x))
+cluster.sizes = t(sapply(full.clusters, function(x) {
+    sizes = table(x)
+    sizesLong = sizes[as.character(1:nclust)]
+    sizesLong[is.na(sizesLong)] = 0
+    return(sizesLong)
+}))
+rownames(cluster.sizes)= rownames(expdata)
+```
+
+
+And finally, we again perform correspondence analysis and make some
+plots.
+
+```r
+out.coa = dudi.coa(cluster.sizes, scannf = FALSE, nf = 6)
+```
+
+```
+## Warning in data.row.names(row.names, rowsi, i): some row.names duplicated:
+## 73,88,117,129,134,154,162,185 --> row.names NOT used
+```
+
+```r
+cors = cor(out.fc@centers, out.coa$co)
+cors = data.frame(cors)
+cors$name = rownames(cors)
+axis1percent = round(out.coa$eig[1] / sum(out.coa$eig) * 100, digits = 1)
+axis2percent = round(out.coa$eig[2] / sum(out.coa$eig) * 100, digits = 1)
+plot(out.coa$eig, type = 'h')
+```
+
+![plot of chunk coafunctional](figure/coafunctional-1.png)
+
+```r
+(p1 = ggplot(data.frame(out.coa$li, expdata)) +
+    geom_point( aes(x = Axis1, y = Axis2, color = Stim)) +
+        xlab(paste("Axis 1: ", axis1percent, "%", sep = "")) +
+            ylab(paste("Axis 2: ", axis2percent, "%", sep = "")))
+```
+
+![plot of chunk coafunctional](figure/coafunctional-2.png)
+
+```r
+(p2 = ggplot(cors, aes(x = Comp1, y = Comp2, label = name)) + 
+    geom_text_repel(size = 2) + geom_point(size = 1) +
+        xlim(c(-.9,1)) + ylim(c(-.55, .5)) +
+            xlab("Correlation with axis 1") + ylab("Correlation with\naxis 2"))
+```
+
+![plot of chunk coafunctional](figure/coafunctional-3.png)
+
+```r
+(p3 = ggplot(data.frame(out.coa$co, out.fc@centers)) +
+    geom_point(aes(x = Comp1, y = Comp2, color = INFg)) +
+        scale_color_viridis(guide = guide_legend(title = "IFN-g"))  +
+            xlab(paste("Axis 1: ", axis1percent, "%", sep = "")) +
+                ylab(paste("Axis 2: ", axis2percent, "%", sep = "")))
+```
+
+![plot of chunk coafunctional](figure/coafunctional-4.png)
+
+```r
+(p4 = ggplot(data.frame(out.coa$co, out.fc@centers)) +
+    geom_point(aes(x = Comp1, y = Comp2, color = MIP1b)) +
+        scale_color_viridis(guide = guide_legend(title = "MIP-1b")) + 
+            xlab(paste("Axis 1: ", axis1percent, "%", sep = "")) +
+                ylab(paste("Axis 2: ", axis2percent, "%", sep = "")))
+```
+
+![plot of chunk coafunctional](figure/coafunctional-5.png)
+
+
+
+## Testing
+
+We can use the features from the previous section (the number or
+fraction of cells in each sample falling in each section of the
+partitioned receptor space) to do testing. Here we apply the
+Friedman-Rafsky test, which is a two-sample multivariate test based on
+distances. For each sample, we have a vector containing the proportion
+of cells falling in each section of the space, and we use as a
+distance on the samples the distance between those vectors. After
+computing these distances, we compute a minimum spanning tree over the
+samples using the distances between the proportion vectors. The
+Friedman-Rafsky test statistic is the number of pure edges in this
+tree (the number of edges connecting two samples in the same class),
+and the null distribution is approximated by permutation. 
+
+First we get the cluster proportions from the cluster sizes and define
+the function that will do our test for us. 
+
+```r
+library(igraph)
+cluster.proportions = t(apply(cluster.sizes, 1, function(x) x / sum(x)))
+
+
+fr_test = function(types) {
+    d = dist(cluster.proportions[expdata$Stim %in% types,])
+    g = graph.adjacency(as.matrix(d), weighted = TRUE, mode = "undirected", diag = FALSE)
+    mst = minimum.spanning.tree(g)
+    el = get.edgelist(mst)
+
+    typelist = el
+    typelist[,1] = expdata[el[,1], "Stim"]
+    typelist[,2] = expdata[el[,2], "Stim"]
+    npure = sum(apply(typelist, 1, function(x) x[1] == x[2]))
+
+    niter = 1999
+    npureNull = numeric(niter)
+    permexpdata = subset(expdata, expdata$Stim %in% types)    
+    for(i in 1:niter) {
+        for(ex in unique(permexpdata$Exp)) {
+            idx = which(permexpdata$Exp == ex)
+            permexpdata[idx,"Stim"] = sample(permexpdata[idx, "Stim"], size = length(idx))
+        }
+        typelistPerm = el
+        typelistPerm[,1] = permexpdata[el[,1], "Stim"]
+        typelistPerm[,2] = permexpdata[el[,2], "Stim"]
+        npurePerm = sum(apply(typelistPerm, 1, function(x) x[1] == x[2]))
+        npureNull[i] = npurePerm
+    }
+    
+
+    qplot(npureNull, geom = "histogram")
+    mean(c(npureNull, npure) >= npure)
+    return(list(pval = mean(c(npureNull, npure) >= npure),
+                null = npureNull, npure = npure))
+}
+```
+
+
+Then we can use this function to test every pair of conditions. 
+
+```r
+fr_test(c("unstimulated", "IL12/IL15/IL18"))$pval
+```
+
+```
+## [1] 0.019
+```
+
+```r
+fr_test(c("unstimulated", "IL15"))$pval
+```
+
+```
+## [1] 0.0085
+```
+
+```r
+fr_test(c("unstimulated", "IL2"))$pval
+```
+
+```
+## [1] 0.027
+```
+
+```r
+fr_test(c("IL12/IL15/IL18", "IL15"))$pval
+```
+
+```
+## [1] 0.0295
+```
+
+```r
+fr_test(c("IL12/IL15/IL18", "IL2"))$pval
+```
+
+```
+## [1] 0.015
+```
+
+```r
+fr_test(c("IL15", "IL2"))$pval
+```
+
+```
+## [1] 0.231
+```
